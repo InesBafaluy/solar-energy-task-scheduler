@@ -48,3 +48,5 @@ solar-energy-task-scheduler/
 For one shelter and one forecast day, the platform can load the three inputs, display an electricity forecast and produce a feasible agenda with a clear list of any unscheduled tasks.
 
 We start with manual data uploads and a simple interface. Automatic monitoring imports, multiple shelters and equipment control can come later.
+
+# MSCT python test
