@@ -7,8 +7,7 @@ import matplotlib.pyplot as plt
 
 import config
 from src.collect_data.get_weather import get_weather_forecast
-from predict.predictor_models.pvlib_predictor import predict_pvlib
-
+from src.predict.predictor_models.pvlib_predictor import predict_pvlib
 
 def main():
 
@@ -35,7 +34,7 @@ def main():
 
     # PREDICT SOLAR PRODUCTION
     # Give the weather DataFrame directly to the predictor
-    predictions = predict_pvlib(weather)
+    predictions = predict_pvlib(weather, interval_minutes=60)
 
     # SAVE RESULTS
     output_folder = Path(config.OUTPUT_DIR)
