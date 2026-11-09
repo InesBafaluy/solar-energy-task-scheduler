@@ -19,21 +19,23 @@ Solar production and consumption are different: weather helps predict production
 
 ```text
 solar-energy-task-scheduler/
-├── README.md              # Project goal and build steps
-├── requirements.txt       # Python dependencies
-├── .gitignore             # Exclude private data and credentials
-├── app.py                 # Platform: electricity forecast and daily agenda
+├── README.md
+├── requirements.txt
+├── config.py              # Configuration loader
 ├── config.example.json    # Example location and electrical system limits
 ├── src/
-│   ├── collect_data.py    # Read OpenWeather, monitoring history and tasks
-│   ├── predict.py         # Estimate next-day production and consumption
-│   └── schedule.py        # Turn available electricity and tasks into an agenda
+│   ├── collect_data/
+│   │   └── get_weather.py         # OpenWeather forecast
+│   ├── predict/
+│   │   ├── predictor_models/      # pvlib, linear, random forest and gradient boosting models
+│   │   └── predictors_comparator.py   # Compare the models against measurements
+│   └── schedule.py                # Turn available electricity and tasks into an agenda
 ├── data/
 │   ├── sample/            # Synthetic examples that can be shared on GitHub
 │   └── private/           # Real monitoring exports and task data; excluded from Git
+├── outputs/               # Forecast results (CSV)
 └── LICENSE                # MIT license
 ```
-
 
 ## Build steps
 
@@ -48,5 +50,3 @@ solar-energy-task-scheduler/
 For one shelter and one forecast day, the platform can load the three inputs, display an electricity forecast and produce a feasible agenda with a clear list of any unscheduled tasks.
 
 We start with manual data uploads and a simple interface. Automatic monitoring imports, multiple shelters and equipment control can come later.
-
-# MSCT python test
