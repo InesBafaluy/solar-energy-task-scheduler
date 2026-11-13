@@ -59,7 +59,7 @@ La construction de l'agenda relève de l'**ordonnancement sous contraintes** (*c
 
 Très rapide : résout le problème en quelques secondes.
 
-- Déclarer, pour chaque tâche, un créneau de départ à choisir, puis les contraintes : fenêtre horaire, durée, puissance totale ≤ puissance disponible à chaque heure, réserve de batterie.
+- Déclarer, pour chaque tâche, un créneau de départ à choisir, puis les contraintes : fenêtre horaire, durée, puissance totale ≤ puissance disponible à chaque heure, réserve de batterie. Contrainte supplémentaire potentielle : Cette tâche a été faite à ce moment même si c'était pas le bon moment préconisé, le prendre en compte. 
 - Ajouter un objectif, par exemple maximiser la somme des priorités des tâches planifiées. Les tâches qui ne rentrent pas ressortent alors comme non planifiées.
 
 ### 2. PuLP ou Pyomo (programmation linéaire en nombres entiers)
@@ -85,7 +85,8 @@ Commencer par coder le point 4, puis passer à OR-Tools (point 1) et comparer le
 
 ## Questions à trancher 
 
-- [ ] **Interruptibilité** : les tâches sont-elles interruptibles (on peut les couper et les reprendre) ou non ?  A VERIFIER 
-- [ ] **Batterie** : est-ce un simple seuil minimal à respecter, ou faut-il simuler son niveau heure par heure ? Exemple de seuil : garder toujours au moins X % de batterie en réserve pour le frigo, l'éclairage, la radio… INFO OBTENUE DANS LA DATA 
+- [ ] **Interruptibilité** : les tâches sont-elles interruptibles (on peut les couper et les reprendre) ou non ?  Non interruptibles ! 
+- [ ] **Batterie** : est-ce un simple seuil minimal à respecter, ou faut-il simuler son niveau heure par heure ? Exemple de seuil : garder toujours au moins X % de batterie en réserve pour le frigo, l'éclairage, la radio… INFO OBTENUE DANS LA DATA --> 0,30 kilowhatt/H de minimum
 - [ ] **Pas de temps** : à quel rythme découpe-t-on la journée ? Créneaux d'1 h (24 créneaux par jour), de 30 min, d'1 h 30… ? PAS DE CRENEAU CAR TROP COMPLIQUE (on sait la durée précise de certaines tâches)
 >>>>>>> Stashed changes
+
