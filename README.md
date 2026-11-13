@@ -85,7 +85,7 @@ Commencer par coder le point 4, puis passer à OR-Tools (point 1) et comparer le
 
 ## Questions à trancher 
 
-- [ ] **Interruptibilité** : les tâches sont-elles interruptibles (on peut les couper et les reprendre) ou non ?
-- [ ] **Batterie** : est-ce un simple seuil minimal à respecter, ou faut-il simuler son niveau heure par heure ? Exemple de seuil : garder toujours au moins X % de batterie en réserve pour le frigo, l'éclairage, la radio…
-- [ ] **Pas de temps** : à quel rythme découpe-t-on la journée ? Créneaux d'1 h (24 créneaux par jour), de 30 min, d'1 h 30… ?
+- [ ] **Interruptibilité** : les tâches sont-elles interruptibles (on peut les couper et les reprendre) ou non ?  A VERIFIER 
+- [ ] **Batterie** : est-ce un simple seuil minimal à respecter, ou faut-il simuler son niveau heure par heure ? Exemple de seuil : garder toujours au moins X % de batterie en réserve pour le frigo, l'éclairage, la radio… INFO OBTENUE DANS LA DATA 
+- [ ] **Pas de temps** : à quel rythme découpe-t-on la journée ? Créneaux d'1 h (24 créneaux par jour), de 30 min, d'1 h 30… ? PAS DE CRENEAU CAR TROP COMPLIQUE (on sait la durée précise de certaines tâches)
 >>>>>>> Stashed changes
