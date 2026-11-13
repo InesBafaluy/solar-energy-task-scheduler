@@ -72,7 +72,7 @@ Plus facile à utiliser que OR-Tools.
 
 - Même principe que PuLP, avec moins de dépendances.
 
-### 4. Sans librairie : heuristique gloutonne
+### 4. Sans librairie : 
 
 Une première version simple du modèle.
 
