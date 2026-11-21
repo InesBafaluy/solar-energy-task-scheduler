@@ -83,9 +83,24 @@ Une première version simple du modèle.
 
 Commencer par coder le point 4, puis passer à OR-Tools (point 1) et comparer les deux agendas.
 
-## Notes importantes
+### Décisions prises
 
-- [ ] **Interruptibilité** : les tâches sont non interruptibles 
-- [ ] **Batterie** : il existe un seuil minimal de batterie à conserver en cas d'extrême urgence (environ 0,20 à 0,30kW/H)
+- **Tâches non interruptibles** : une tâche est un bloc continu de durée fixe.
+- **Pas de découpage en créneaux** : le modèle travaille à la minute et utilise la durée exacte de chaque tâche.
+- **Batterie** : le niveau est suivi heure par heure et ne descend jamais sous la réserve minimale de **0,30 kWh** (valeur issue de la data). Une cible de niveau en fin de journée est ajustable dans `system.json`.
+- **Tâche déjà réalisée** : si une tâche a déjà été faite à une heure donnée, même hors du moment préconisé, cet horaire est imposé (colonne `forced_start`) et le reste de l'agenda s'organise autour.
+- **Objectif** : planifier le plus de priorité possible, puis utiliser le moins possible le groupe électrogène, puis démarrer les tâches tôt. Les tâches qui ne rentrent pas sont listées comme **non planifiées**.
+
+### Système électrique du refuge
+
+- **Installation photovoltaïque** : 22 panneaux de 500 W, soit **11 kWc**
+- **Groupe électrogène** (recharge des batteries par mauvais temps) : **20 kW nominal, réduit à 12 kW à 2 500 m d'altitude**. Le modèle utilise 12 kW
+- **Réserve minimale de la batterie** : 0,30 kWh
+
+### Limites connues du modèle
+
+- La puissance de charge de la batterie n'est pas limitée.
+- Les priorités comptent linéairement : plusieurs petites tâches peuvent passer avant une grosse tâche de priorité élevée. À ajuster si certaines tâches sont indispensables.
+- Le budget carburant du groupe électrogène (`genset_max_kwh_per_day`) est une valeur fictive à confirmer.
 >>>>>>> Stashed changes
 
