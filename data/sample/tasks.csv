@@ -1,0 +1,11 @@
+task_id,name,priority,duration_min,power_kw,earliest_start,deadline,forced_start
+T01,Remplissage de la citerne (pompe),5,45,1.2,07:00,20:00,10:30
+T02,Four électrique (préparation du dîner),5,75,3.5,16:00,19:30,
+T03,Chauffe-eau (douches),4,120,3.0,09:00,19:00,
+T04,Lave-vaisselle,4,60,1.8,13:00,21:00,
+T05,Lessive (draps),3,90,2.0,08:00,18:00,
+T06,Traitement UV de l'eau,3,240,0.4,08:00,20:00,
+T07,Séchoir à chaussures,3,180,2.5,14:00,20:00,
+T08,Aspirateur dortoirs,2,60,1.2,09:30,15:00,
+T09,Recharge outils et ordinateurs,1,120,0.3,08:00,22:00,
+T10,Dégivrage du congélateur,2,180,0.5,10:00,17:00,

@@ -83,10 +83,9 @@ Une première version simple du modèle.
 
 Commencer par coder le point 4, puis passer à OR-Tools (point 1) et comparer les deux agendas.
 
-## Questions à trancher 
+## Notes importantes
 
-- [ ] **Interruptibilité** : les tâches sont-elles interruptibles (on peut les couper et les reprendre) ou non ?  Non interruptibles ! 
-- [ ] **Batterie** : est-ce un simple seuil minimal à respecter, ou faut-il simuler son niveau heure par heure ? Exemple de seuil : garder toujours au moins X % de batterie en réserve pour le frigo, l'éclairage, la radio… INFO OBTENUE DANS LA DATA --> 0,30 kilowhatt/H de minimum
-- [ ] **Pas de temps** : à quel rythme découpe-t-on la journée ? Créneaux d'1 h (24 créneaux par jour), de 30 min, d'1 h 30… ? PAS DE CRENEAU CAR TROP COMPLIQUE (on sait la durée précise de certaines tâches)
+- [ ] **Interruptibilité** : les tâches sont non interruptibles 
+- [ ] **Batterie** : il existe un seuil minimal de batterie à conserver en cas d'extrême urgence (environ 0,20 à 0,30kW/H)
 >>>>>>> Stashed changes
 
