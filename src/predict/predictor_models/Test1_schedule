@@ -1,0 +1,191 @@
+# =====================================================================
+# schedule.py : agenda quotidien du refuge avec OR-Tools (CP-SAT)
+# Lancer depuis la racine du dépôt :  python src/schedule.py
+# =====================================================================
+import os                                        # module os : construire des chemins de fichiers (notebook 1)
+import json                                      # module json : lire le fichier system.json
+import numpy as np                               # numpy : tableaux et slicing (notebook 4)
+import pandas as pd                              # pandas : tableaux de données (notebook 9)
+import plotly.express as px                      # plotly express : graphique interactif (notebook 10)
+from ortools.sat.python import cp_model          # OR-Tools : le solveur qui décide de l'agenda
+
+DATA = os.path.join("data", "sample")            # dossier des données fictives (os.path.join)
+OUT = "outputs"                                  # dossier où écrire les résultats
+WMIN = 60000                                     # 1 kWh = 1000 Wh = 60 000 W·min (le solveur ne gère que des entiers)
+
+
+def to_min(hhmm):                                # convertit "08:30" en minutes depuis minuit
+    h, m = hhmm.split(":")                       # split : coupe la chaîne sur ":" (notebook 2)
+    return int(h) * 60 + int(m)                  # int() : conversion de type (notebook 2)
+
+
+def to_hhmm(minute):                             # convertit 510 en "08:30"
+    return f"{minute // 60:02d}:{minute % 60:02d}"   # f-string, division entière // et modulo % (notebooks 1 et 2)
+
+
+def load_data(scenario="sunny"):                 # argument par défaut (notebook 7)
+    with open(os.path.join(DATA, "system.json"), encoding="utf-8") as f:   # ouvre le fichier du système électrique
+        system = json.load(f)                    # dictionnaire des paramètres (notebook 2 : dict)
+    forecast = pd.read_csv(os.path.join(DATA, f"forecast_{scenario}.csv"))   # pandas : prévision horaire du scénario
+    tasks = pd.read_csv(os.path.join(DATA, "tasks.csv"))                    # pandas : liste des tâches
+    tasks["dur"] = tasks["duration_min"].astype(int)                        # nouvelle colonne : durée en entier
+    tasks["p_w"] = (tasks["power_kw"] * 1000).round().astype(int)           # nouvelle colonne : puissance en W (calcul sur toute la colonne)
+    tasks["energy_kwh"] = tasks["power_kw"] * tasks["dur"] / 60             # nouvelle colonne : énergie de la tâche
+    tasks["forced"] = tasks["forced_start"].notna()                         # colonne booléenne : tâche déjà réalisée ?
+    tasks["lo"] = tasks["earliest_start"].map(to_min)                       # .map : applique to_min à chaque ligne -> début au plus tôt
+    tasks["hi"] = tasks["deadline"].map(to_min) - tasks["dur"]              # début au plus tard = deadline - durée
+    forced_min = tasks.loc[tasks["forced"], "forced_start"].map(to_min)     # .loc + filtre booléen : minute des tâches déjà réalisées
+    tasks.loc[tasks["forced"], "lo"] = forced_min                           # pour ces tâches, début au plus tôt = heure imposée
+    tasks.loc[tasks["forced"], "hi"] = forced_min                           # et début au plus tard = heure imposée
+    return system, forecast, tasks               # renvoie trois objets d'un coup (tuple)
+
+
+def solve(system, forecast, tasks, soc0, time_limit=20):   # soc0 = batterie initiale (kWh)
+    # --- Données en entiers (W) : numpy arrondit, puis .tolist() donne des int Python ---
+    pv = (forecast["pv_kw"].to_numpy() * 1000).round().astype(int).tolist()          # production solaire par heure (W)
+    base = (forecast["base_load_kw"].to_numpy() * 1000).round().astype(int).tolist() # consommation de base par heure (W)
+    inv = int(system["inverter_max_kw"] * 1000)              # puissance max de l'onduleur (W)
+    batt = int(system["battery_max_discharge_kw"] * 1000)    # puissance max de décharge de la batterie (W)
+    gmax = int(system["genset_derated_kw"] * 1000)           # groupe électrogène : 12 kW à 2 500 m, pas 20 kW
+    cap = int(system["battery_capacity_kwh"] * WMIN)         # capacité de la batterie (W·min)
+    reserve = int(system["battery_reserve_kwh"] * WMIN)      # réserve minimale : 0,30 kWh
+    target = int(system["end_of_day_soc_target_kwh"] * WMIN) # niveau visé en fin de journée
+    mdl = cp_model.CpModel()                                 # le modèle (variables + contraintes + objectif)
+
+    # --- Variables des tâches ---
+    usable = tasks[tasks["hi"] >= tasks["lo"]]               # filtre booléen pandas : on retire les tâches dont la fenêtre est trop courte
+    starts, present, ivs, dem = {}, {}, [], []               # dictionnaires et listes vides (notebook 2)
+    for t in usable.itertuples():                            # boucle for sur chaque tâche (notebook 5)
+        starts[t.task_id] = mdl.NewIntVar(int(t.lo), int(t.hi), f"s_{t.task_id}")   # variable : minute de démarrage
+        present[t.task_id] = mdl.NewConstant(1) if t.forced else mdl.NewBoolVar(f"p_{t.task_id}")   # planifiée (1) ou non (0)
+        ivs.append(mdl.NewOptionalFixedSizeIntervalVar(starts[t.task_id], int(t.dur), present[t.task_id], f"i_{t.task_id}"))   # bloc continu : non interruptible
+        dem.append(int(t.p_w))                               # puissance demandée par ce bloc
+
+    # --- Groupe électrogène et puissance disponible heure par heure ---
+    gen = [mdl.NewIntVar(0, gmax, f"g{h}") for h in range(24)]   # liste en compréhension (notebook 7) : puissance du groupe par heure
+    mdl.Add(sum(gen) <= int(system["genset_max_kwh_per_day"] * 1000))   # budget carburant de la journée
+    for h in range(24):                                      # pour chacune des 24 heures
+        avail = mdl.NewIntVar(0, inv, f"a{h}")               # puissance disponible pour les tâches cette heure-là
+        mdl.AddMinEquality(avail, [inv - base[h], max(0, pv[h] + batt - base[h]) + gen[h]])   # le plus petit de : onduleur, solaire+batterie+groupe
+        blocked = mdl.NewIntVar(0, inv, f"b{h}")             # puissance NON disponible
+        mdl.Add(blocked == inv - avail)                      # = onduleur - disponible
+        ivs.append(mdl.NewFixedSizeIntervalVar(60 * h, 60, f"bl{h}"))   # faux bloc d'une heure qui « réserve » cette puissance
+        dem.append(blocked)                                  # sa demande = la puissance bloquée
+    mdl.AddCumulative(ivs, dem, inv)                         # à chaque minute : somme des puissances <= onduleur
+
+    # --- Batterie : niveau à la fin de chaque heure ---
+    prev = min(int(soc0 * WMIN), cap)                        # niveau de départ
+    for h in range(24):                                      # heure après heure
+        used = []                                            # énergie des tâches pendant l'heure h
+        for t in usable.itertuples():                        # pour chaque tâche utilisable
+            if t.hi + t.dur <= 60 * h or t.lo >= 60 * h + 60:   # la tâche ne peut pas toucher cette heure
+                continue                                     # on passe à la suivante (continue, notebook 5)
+            end = mdl.NewIntVar(0, 1500, "")                 # fin de la tâche coupée à la fin de l'heure
+            mdl.AddMinEquality(end, [starts[t.task_id] + int(t.dur), 60 * h + 60])   # min(fin, fin d'heure)
+            beg = mdl.NewIntVar(0, 1440, "")                 # début de la tâche coupé au début de l'heure
+            mdl.AddMaxEquality(beg, [starts[t.task_id], 60 * h])   # max(début, début d'heure)
+            ov = mdl.NewIntVar(0, 60, "")                    # minutes de la tâche dans l'heure h
+            mdl.AddMaxEquality(ov, [end - beg, 0])           # jamais négatif
+            ove = mdl.NewIntVar(0, 60, "")                   # idem, mais 0 si la tâche n'est pas planifiée
+            mdl.Add(ove == ov).OnlyEnforceIf(present[t.task_id])   # planifiée : on compte
+            mdl.Add(ove == 0).OnlyEnforceIf(present[t.task_id].Not())   # non planifiée : 0
+            used.append(int(t.p_w) * ove)                    # énergie = puissance x minutes
+        raw = mdl.NewIntVar(-10**9, 10**9, "")               # niveau avant plafonnement
+        mdl.Add(raw == prev + 60 * (pv[h] - base[h] + gen[h]) - sum(used))   # bilan de l'heure : + solaire + groupe - base - tâches
+        cur = mdl.NewIntVar(0, cap, "")                      # niveau réel (le surplus est perdu si batterie pleine)
+        mdl.AddMinEquality(cur, [raw, cap])                  # plafonné à la capacité
+        mdl.Add(cur >= reserve)                              # jamais sous 0,30 kWh
+        prev = cur                                           # ce niveau devient le point de départ de l'heure suivante
+    mdl.Add(prev >= target)                                  # niveau minimal en fin de journée
+
+    # --- Objectif : priorités d'abord, puis moins de groupe, puis départs tôt ---
+    mdl.Maximize(sum(100000 * int(t.priority) * present[t.task_id] for t in usable.itertuples())   # valeur des tâches planifiées
+                 - 10 * sum(gen)                             # coût du groupe électrogène
+                 - sum(starts.values()))                     # petit malus de retard (valeurs du dict)
+    solver = cp_model.CpSolver()                             # le solveur
+    solver.parameters.max_time_in_seconds = time_limit       # temps maximum
+    solver.parameters.relative_gap_limit = 0.0001            # on s'arrête à 0,01 % de l'optimum
+    solver.parameters.num_workers = 8                        # calcul en parallèle
+    status = solver.StatusName(solver.Solve(mdl))            # résolution, puis nom du statut
+    if status not in ("OPTIMAL", "FEASIBLE"):                # aucun agenda trouvé
+        return None, None, status                            # on le signale
+    plan = {t.task_id: solver.Value(starts[t.task_id]) for t in usable.itertuples() if solver.Value(present[t.task_id])}   # dict : tâche planifiée -> minute de départ
+    return plan, [solver.Value(g) for g in gen], status      # agenda, groupe par heure, statut
+
+
+def build_agenda(tasks, plan):                   # fabrique le tableau de l'agenda avec pandas
+    agenda = tasks.assign(start_min=tasks["task_id"].map(plan))   # .assign + .map(dict) : minute de départ, NaN si non planifiée
+    ok = agenda["start_min"].notna()             # colonne booléenne : la tâche est-elle planifiée ?
+    agenda["status"] = np.where(ok, "planifiée", "NON planifiée")   # np.where : choisit le texte selon le booléen (notebook 4)
+    agenda["start"] = agenda["start_min"].map(lambda s: to_hhmm(int(s)) if pd.notna(s) else "")   # heure de début en "HH:MM"
+    agenda["end"] = (agenda["start_min"] + agenda["dur"]).map(lambda e: to_hhmm(int(e)) if pd.notna(e) else "")   # heure de fin
+    cols = ["task_id", "name", "priority", "status", "start", "end", "power_kw", "energy_kwh", "forced"]   # colonnes à garder
+    return agenda[cols].sort_values(["status", "start"], ascending=[False, True])   # planifiées d'abord, puis par heure
+
+
+def check(tasks, plan, gen, forecast, system, soc0):   # vérification INDÉPENDANTE du solveur (avec numpy)
+    load = np.zeros(1440)                        # puissance des tâches minute par minute (notebook 4)
+    problems = []                                # liste des problèmes détectés
+    for t in tasks.itertuples():                 # pour chaque tâche
+        if t.task_id in plan:                    # si elle est planifiée
+            s = plan[t.task_id]                  # minute de départ
+            load[s:s + t.dur] += t.power_kw      # slicing : on ajoute sa puissance sur ses minutes (notebook 4)
+            if not t.forced and not (t.lo <= s <= t.hi):   # fenêtre horaire respectée ?
+                problems.append(f"{t.task_id} hors de sa fenêtre")   # sinon on le note
+    by_hour = load.reshape(24, 60)               # 24 lignes (heures) x 60 colonnes (minutes) (notebook 4)
+    tasks_kwh = by_hour.sum(axis=1) / 60         # énergie des tâches par heure (kWh)
+    pv, base = forecast["pv_kw"].to_numpy(), forecast["base_load_kw"].to_numpy()   # colonnes pandas -> tableaux numpy (kW)
+    gen_kw = np.array(gen) / 1000                # groupe par heure (kW)
+    avail = np.minimum(system["inverter_max_kw"] - base, pv + system["battery_max_discharge_kw"] - base + gen_kw)   # puissance disponible
+    if not (by_hour.max(axis=1) <= avail + 1e-6).all():   # tableau booléen puis .all() (notebook 4)
+        problems.append("puissance dépassée")    # une heure dépasse la puissance disponible
+    soc, socs = min(soc0, system["battery_capacity_kwh"]), []   # niveau de batterie recalculé à la main
+    for h in range(24):                          # heure par heure
+        soc = min(system["battery_capacity_kwh"], soc + pv[h] + gen_kw[h] - base[h] - tasks_kwh[h])   # bilan de l'heure
+        socs.append(soc)                         # on mémorise le niveau
+    if min(socs) < system["battery_reserve_kwh"] - 1e-6:   # sous la réserve ?
+        problems.append("batterie sous la réserve")        # problème
+    if socs[-1] < system["end_of_day_soc_target_kwh"] - 1e-6:   # objectif de fin de journée atteint ?
+        problems.append("batterie sous l'objectif de fin de journée")   # problème
+    hourly = pd.DataFrame({"hour": range(24), "pv_kw": pv, "base_kw": base, "genset_kw": gen_kw,   # tableau pandas : bilan horaire, colonnes 1 à 4
+                           "tasks_kwh": tasks_kwh, "soc_kwh": socs}).round(3)   # colonnes 5 et 6, arrondi à 3 décimales
+    hourly = hourly.merge(forecast[["hour", "cloud_cover_pct"]], on="hour")   # .merge : ajoute la nébulosité en joignant sur la colonne "hour"
+    return hourly, problems                      # bilan et liste de problèmes
+
+
+def plot(agenda, scenario):                      # graphique interactif de l'agenda
+    done = agenda[agenda["status"] == "planifiée"].copy()   # filtre booléen : seulement les tâches planifiées
+    done["Début"] = pd.to_datetime("2026-01-01 " + done["start"])   # plotly veut des dates : jour fictif + heure
+    done["Fin"] = pd.to_datetime("2026-01-01 " + done["end"])       # idem pour la fin
+    fig = px.timeline(done, x_start="Début", x_end="Fin", y="name", color="forced",   # diagramme de Gantt : une barre par tâche, couleur selon « déjà réalisée »
+                      title=f"Agenda proposé : journée {scenario}")   # titre du graphique (f-string)
+    fig.update_yaxes(autorange="reversed")       # première tâche en haut
+    fig.write_html(os.path.join(OUT, f"agenda_{scenario}.html"))   # sauvegarde (s'ouvre dans le navigateur)
+
+
+def run(scenario="sunny", **options):            # **options : arguments facultatifs, par ex. time_limit=10 (notebook 7)
+    system, forecast, tasks = load_data(scenario)   # lecture des entrées
+    soc0 = system["initial_soc_kwh"][scenario]   # batterie au début de la journée
+    plan, gen, status = solve(system, forecast, tasks, soc0, **options)   # ** : on transmet les options au solveur
+    print(f"\n=== {scenario} | batterie initiale {soc0} kWh | solveur : {status} ===")   # titre
+    if plan is None:                             # pas d'agenda possible
+        print("Aucun agenda possible : vérifier les tâches déjà réalisées.")   # message
+        return                                   # on s'arrête
+    agenda = build_agenda(tasks, plan)           # tableau de l'agenda
+    hourly, problems = check(tasks, plan, gen, forecast, system, soc0)   # vérification
+    os.makedirs(OUT, exist_ok=True)              # crée le dossier outputs s'il n'existe pas
+    agenda.to_csv(os.path.join(OUT, f"agenda_{scenario}.csv"), index=False)   # agenda en CSV
+    hourly.to_csv(os.path.join(OUT, f"hourly_{scenario}.csv"), index=False)   # bilan horaire en CSV
+    plot(agenda, scenario)                       # graphique
+    print(agenda.to_string(index=False))         # agenda dans le terminal
+    print(agenda.groupby("status")["energy_kwh"].agg(["count", "sum"]).round(1))   # .groupby + .agg : nombre de tâches et énergie par statut
+    unscheduled = set(tasks["task_id"]) - set(plan)   # différence de sets (notebook 2) : tâches non planifiées
+    print(f"Tâches non planifiées : {sorted(unscheduled)}")   # liste
+    print("Heures de groupe électrogène :", hourly.loc[hourly["genset_kw"] > 0, "hour"].tolist())   # .loc + filtre booléen : heures où le groupe tourne
+    print(f"Groupe électrogène : {sum(gen) / 1000:.1f} kWh | batterie fin de journée : {hourly['soc_kwh'].iloc[-1]:.1f} kWh")   # f-string formaté
+    print("Vérification indépendante :", "OK" if not problems else problems)   # résultat du contrôle
+
+
+if __name__ == "__main__":                       # exécuté seulement si on lance ce fichier directement
+    for sc in ["sunny", "cloudy"]:               # les deux journées test
+        run(sc, time_limit=20)                   # on lance l'agenda avec 20 s maximum
