@@ -1,0 +1,11 @@
+task_id,name,priority,status,start,end,power_kw,energy_kwh,forced
+T05,Lessive (draps),3,planifiée,08:00,09:30,2.0,3.0,False
+T06,Traitement UV de l'eau,3,planifiée,08:00,12:00,0.4,1.6,False
+T09,Recharge outils et ordinateurs,1,planifiée,08:00,10:00,0.3,0.6,False
+T03,Chauffe-eau (douches),4,planifiée,09:00,11:00,3.0,6.0,False
+T08,Aspirateur dortoirs,2,planifiée,10:00,11:00,1.2,1.2,False
+T10,Dégivrage du congélateur,2,planifiée,10:00,13:00,0.5,1.5,False
+T01,Remplissage de la citerne (pompe),5,planifiée,10:30,11:15,1.2,0.9,True
+T04,Lave-vaisselle,4,planifiée,13:00,14:00,1.8,1.8,False
+T07,Séchoir à chaussures,3,planifiée,14:00,17:00,2.5,7.5,False
+T02,Four électrique (préparation du dîner),5,planifiée,16:00,17:15,3.5,4.375,False
