@@ -10,6 +10,11 @@ A platform that helps the keeper of one mountain shelter decide when to run dail
 
 Solar production and consumption are different: weather helps predict production, while past usage and planned tasks help estimate consumption. Check which measurements the monitoring website provides before building the prediction.
 
+Historical Deye Cloud data can be archived locally as raw JSON and CSV using
+[`get_deye_history.py`](src/collect_data/get_deye_history.py). See the
+[download instructions](docs/deye-download.md) for authentication, date ranges,
+resuming downloads and data-quality limits. Real data stays in `data/private/`.
+
 ## Three inputs
 
 - **OpenWeather:** weather forecast for the shelter.

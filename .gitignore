@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Real monitoring data stays on this computer.
+data/private/*
+!data/private/.gitkeep
+.env.*
+!.env.example
