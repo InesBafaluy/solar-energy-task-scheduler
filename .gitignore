@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Real plant measurements and metadata stay local.
+data/private/*
+!data/private/.gitkeep
