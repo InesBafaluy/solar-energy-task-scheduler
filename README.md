@@ -1,5 +1,5 @@
 =======
-# Solar Energy Task Scheduler
+## Solar Energy Task Scheduler
 
 A platform that helps the keeper of one mountain shelter decide when to run daily tasks based on expected electricity availability.
 
@@ -27,14 +27,17 @@ solar-energy-task-scheduler/
 ├── config.example.json    # Example location and electrical system limits
 ├── src/
 │   ├── collect_data.py    # Read OpenWeather, monitoring history and tasks
+│   │   └── get_weather.py # OpenWeather forecast
 │   ├── predict.py         # Estimate next-day production and consumption
+│   │   ├── predictor_models/          # pvlib, linear, random forest and gradient boosting models
+│   │   └── predictors_comparator.py   # Compare the models against measurements
 │   └── schedule.py        # Turn available electricity and tasks into an agenda
 ├── data/
 │   ├── sample/            # Synthetic examples that can be shared on GitHub
 │   └── private/           # Real monitoring exports and task data; excluded from Git
+├── outputs/               # Results (CSV and charts)
 └── LICENSE                # MIT license
 ```
-
 
 ## Build steps
 
@@ -51,56 +54,31 @@ For one shelter and one forecast day, the platform can load the three inputs, di
 We start with manual data uploads and a simple interface. Automatic monitoring imports, multiple shelters and equipment control can come later.
 
 
-## Construction de l'agenda : choix de la méthode
+## Building the agenda: choice of method
 
-La construction de l'agenda relève de l'**ordonnancement sous contraintes** (*constraint scheduling*). Plusieurs librairies Python sont envisageables.
+Building the agenda is a **constraint scheduling** problem. Several Python libraries are possible.
+- **OR-Tools (CP-SAT)**: **selected**. Fast (a few seconds), handles cumulative power constraints well.
+- **PuLP or Pyomo** (integer linear programming): easier to get started with, but less suited to a minute-level schedule.
+- **python-mip or SciPy `milp`**: same principle as PuLP, with fewer dependencies.
+- No library: sort the tasks by priority and place each one in the first feasible slot. A possible way to compare schedules, not implemented for now.
 
-### 1. OR-Tools (CP-SAT), de Google
 
-Très rapide : résout le problème en quelques secondes.
+## Decisions made
 
-- Déclarer, pour chaque tâche, un créneau de départ à choisir, puis les contraintes : fenêtre horaire, durée, puissance totale ≤ puissance disponible à chaque heure, réserve de batterie. Contrainte supplémentaire potentielle : Cette tâche a été faite à ce moment même si c'était pas le bon moment préconisé, le prendre en compte. 
-- Ajouter un objectif, par exemple maximiser la somme des priorités des tâches planifiées. Les tâches qui ne rentrent pas ressortent alors comme non planifiées.
+- **Non-interruptible tasks**: a task is a continuous block of fixed duration.
+- **No time slots**: the model works at the minute level and uses the exact duration of each task.
+- **Battery**: the level is tracked hour by hour and never drops below the minimum reserve of **0.30 kWh** (value taken from the data). An end-of-day level target can be adjusted in `system.json`.
+- **Task already done**: if a task has already been carried out at a given time, even outside the recommended time, that time is imposed (`forced_start` column) and the rest of the agenda is organised around it.
+- **Objective**: schedule as much priority as possible, then use the generator as little as possible, then start tasks as early as possible. Tasks that do not fit are listed as **unscheduled**.
 
-### 2. PuLP ou Pyomo (programmation linéaire en nombres entiers)
+## Electrical system of the shelter
 
-Plus facile à utiliser que OR-Tools.
+- **Photovoltaic installation**: 22 panels of 500 W, i.e. **11 kWp**
+- **Generator** (recharges the batteries in bad weather): **20 kW nominal, derated to 12 kW at 2,500 m altitude**. The model uses 12 kW
+- **Minimum battery reserve**: 0.30 kWh
 
-- Définir une variable binaire « la tâche *i* démarre à l'heure *t* » et écrire les contraintes sous forme d'inégalités.
+## Known limitations of the model
 
-### 3. python-mip ou SciPy `milp`
-
-- Même principe que PuLP, avec moins de dépendances.
-
-### 4. Sans librairie : 
-
-Une première version simple du modèle.
-
-- Trier les tâches par priorité, puis les placer dans le premier créneau faisable.
-- Code rapide à écrire avec pandas.
-
-### Piste retenue
-
-Commencer par coder le point 4, puis passer à OR-Tools (point 1) et comparer les deux agendas.
-
-### Décisions prises
-
-- **Tâches non interruptibles** : une tâche est un bloc continu de durée fixe.
-- **Pas de découpage en créneaux** : le modèle travaille à la minute et utilise la durée exacte de chaque tâche.
-- **Batterie** : le niveau est suivi heure par heure et ne descend jamais sous la réserve minimale de **0,30 kWh** (valeur issue de la data). Une cible de niveau en fin de journée est ajustable dans `system.json`.
-- **Tâche déjà réalisée** : si une tâche a déjà été faite à une heure donnée, même hors du moment préconisé, cet horaire est imposé (colonne `forced_start`) et le reste de l'agenda s'organise autour.
-- **Objectif** : planifier le plus de priorité possible, puis utiliser le moins possible le groupe électrogène, puis démarrer les tâches tôt. Les tâches qui ne rentrent pas sont listées comme **non planifiées**.
-
-### Système électrique du refuge
-
-- **Installation photovoltaïque** : 22 panneaux de 500 W, soit **11 kWc**
-- **Groupe électrogène** (recharge des batteries par mauvais temps) : **20 kW nominal, réduit à 12 kW à 2 500 m d'altitude**. Le modèle utilise 12 kW
-- **Réserve minimale de la batterie** : 0,30 kWh
-
-### Limites connues du modèle
-
-- La puissance de charge de la batterie n'est pas limitée.
-- Les priorités comptent linéairement : plusieurs petites tâches peuvent passer avant une grosse tâche de priorité élevée. À ajuster si certaines tâches sont indispensables.
-- Le budget carburant du groupe électrogène (`genset_max_kwh_per_day`) est une valeur fictive à confirmer.
->>>>>>> Stashed changes
-
+- The battery charging power is not limited.
+- Priorities count linearly: several small tasks can be scheduled ahead of one large high-priority task. To be adjusted if some tasks are essential.
+- The generator fuel budget (`genset_max_kwh_per_day`) is a placeholder value to be confirmed.
