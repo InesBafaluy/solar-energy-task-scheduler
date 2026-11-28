@@ -4,6 +4,20 @@ The file `src/collect_data/get_plant_data.py` downloads the plant measurements
 stored by Deye Cloud and keeps a local CSV up to date. It does not predict
 production, calculate a task schedule or control the inverter.
 
+## Where to start reading the code
+
+Start with `get_plant_data()` near the top of `get_plant_data.py`. Its four
+numbered steps show the complete CSV workflow. The helpers below it each do one
+job: select a plant, choose dates, fetch samples, merge rows, or save a file.
+
+`deye_api.py` contains the connection details: reading `.env`, obtaining the
+temporary token, retrying requests and listing accessible plants. You can read
+that file separately without losing the thread of how the CSV is updated.
+
+The API still receives the same 30-day windows, with the same request spacing.
+Numeric timestamps are converted a column at a time to avoid repeated parsing
+of individual readings.
+
 ## Run it
 
 From the project folder:
@@ -32,18 +46,18 @@ the terminal is opened in another folder.
 
 ## What happens, step by step
 
-1. **Read the local settings.** `_settings()` reads `DEYE_APP_ID`,
+1. **Read the local settings.** `deye_api.read_settings()` reads `DEYE_APP_ID`,
    `DEYE_APP_SECRET`, `DEYE_EMAIL` and `DEYE_PASSWORD` from `.env`. Optional
    `DEYE_LOGIN_TYPE` supports mobile or username accounts. An explicit
    environment variable takes priority over the file. Values are never printed.
-2. **Log in to Deye's Europe API.** `_DeyeClient.login()` sends the application
+2. **Log in to Deye's Europe API.** `deye_api.DeyeClient.login()` sends the application
    credentials and account login over HTTPS. Deye requires a SHA-256 form of
    the account password. The response contains a temporary access token, held
    only in memory and used for the monitoring requests.
 3. **Select the plant.** The script reads all pages of the plant list. If the
    account has one plant, it selects that plant. Otherwise set `DEYE_STATION_ID`
    in `.env`, or pass `station_id=...`. A business account can also need
-   `DEYE_COMPANY_ID` to access its organization’s plants.
+   `DEYE_COMPANY_ID` to access its organizationâ€™s plants.
 4. **Choose where to start.** If no CSV exists, use the plant's reported
    operating date. If a CSV exists, read its latest `timestamp_utc`, convert it
    to the plant's local date and request that day again. This allows missing
@@ -85,6 +99,26 @@ plant or endpoint. A blank is not a measured zero.
 The CSV contains the plant-level history exposed to this account. It is not
 an export of Deye's whole database or every detailed inverter measurement.
 
+## Reading the update summary
+
+Each run prints the number of CSV rows and the first/last actual reading before
+and after the update. Dates are shown in the plant's local timezone, with UTC
+offsets. These are measurement dates, not the dates covered by the API request.
+
+It also prints how many rows were genuinely added and the first/last timestamp
+among those new rows. Downloading an existing timestamp again, or correcting its
+values, does not count as adding a row. New readings that fill an older gap do
+count. The reported period spans the first and last added reading; it does not
+imply that every intervening interval has data.
+
+If no new timestamps were found, the message is `New rows added: 0`. Existing
+readings may still have been refreshed. On the first download, all returned rows
+are new. An empty CSV is reported as having no readings yet.
+
+The same information is stored in `energy.metadata.json`: `rows_before`,
+`rows_added`, `csv_period_before`, `csv_period_after` and `added_period`.
+Each period includes both UTC and local timestamps. An empty period is `null`.
+
 ## Optional date ranges
 
 ```powershell
@@ -103,6 +137,6 @@ API success flag as well as HTTP status, and rejects a response that claims more
 records than it actually contains. It also refuses to merge a CSV belonging to
 a different plant or to guess ambiguous local timestamps during clock changes.
 
-Six tests cover first-run CSV creation, incremental updates, corrected readings,
+Tests cover first-run CSV creation, incremental updates, corrected readings,
 missing values, duplicate prevention, date boundaries, wrong-plant protection,
 and preserving a saved CSV when an API request fails.

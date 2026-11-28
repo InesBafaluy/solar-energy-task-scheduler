@@ -1,179 +1,100 @@
-"""Create/update data/private/energy.csv from Deye Cloud plant history.
+"""Create or update the local CSV of Deye plant measurements.
 
-Run: python src/collect_data/get_plant_data.py
-Credentials come from the project's Git-ignored .env file. The first run downloads
-history from the plant's operating date; subsequent runs refresh the last saved
-local day and append new samples. Original API field names and units are retained.
-API reference: https://eu1-developer.deyecloud.com/v2/api-docs
+Run from the project folder: python -m src.collect_data.get_plant_data
+Start with get_plant_data() below to follow the workflow. Connection and login
+details are in deye_api.py; the small helpers below handle dates and CSV files.
 """
 
-from datetime import date, datetime, time as day_time, timedelta, timezone
-from pathlib import Path
 import argparse
-import hashlib
+from datetime import date, datetime, time, timedelta, timezone
 import json
-import os
-import time
+from pathlib import Path
 from zoneinfo import ZoneInfo
-from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import pandas as pd
 
+# Support both "python -m src.collect_data.get_plant_data" and running this file.
+if __package__:
+    from .deye_api import API_URL, DeyeClient, read_settings
+else:
+    from deye_api import API_URL, DeyeClient, read_settings
 
-# Build paths from this Python file, not from the terminal's current folder.
-# This means the script finds the same .env and CSV when run from VS Code,
-# a terminal, or another Python file.
+
+# Always use this project's files, regardless of the terminal's current folder.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-API_URL = "https://eu1-developer.deyecloud.com/v1.0"
 CSV_PATH = PROJECT_ROOT / "data/private/energy.csv"
 
 
-def _settings(env_file):
-    """Read literal .env assignments without printing or executing their values."""
-    settings = {}
-    path = Path(env_file)
-    if path.exists():
-        for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                raise ValueError(f"Invalid .env assignment on line {number}.")
-            key, value = (part.strip() for part in line.split("=", 1))
-            if not key.startswith("DEYE_"):
-                continue
-            # Quotes are optional. Do not interpret $variables, backslashes or
-            # inline # characters: they may be part of the actual password.
-            if value.startswith(('"', "'")):
-                if len(value) < 2 or value[-1] != value[0]:
-                    raise ValueError(f"Unclosed .env quote on line {number}.")
-                value = value[1:-1]
-            if value:
-                settings[key] = value
-    # An explicitly configured environment variable takes priority over .env.
-    settings.update({key: value for key, value in os.environ.items()
-                     if key.startswith("DEYE_") and value})
-    return settings
+def get_plant_data(csv_path=None, station_id=None, start_date=None, end_date=None,
+                   env_file=None, request_interval=2):
+    """Create/update the CSV and return its measurements as a DataFrame.
+
+    First run: download from the plant's operating date. Later runs: refresh
+    the last saved local day and append newer readings. An explicit start_date
+    overrides that rule for a backfill; end_date includes the whole local day.
+    Original measurement names, units and missing values are preserved.
+    """
+    if request_interval < 0:
+        raise ValueError("request_interval cannot be negative.")
+    path = Path(csv_path) if csv_path is not None else CSV_PATH
+
+    # 1. Read credentials and select the plant. Secrets are never printed.
+    settings = read_settings(env_file or PROJECT_ROOT / ".env")
+    client = DeyeClient(settings, interval=request_interval)
+    station = _select_station(client.stations(), station_id or settings.get("DEYE_STATION_ID"))
+    station_id = station["id"]
+    if not station.get("regionTimezone"):
+        raise ValueError("Deye did not return the plant timezone.")
+    zone = ZoneInfo(station["regionTimezone"])
+
+    # 2. Load and validate the existing CSV, then decide what period to fetch.
+    data = pd.read_csv(path, dtype={"station_id": str}) if path.exists() else pd.DataFrame()
+    data = _merge_samples(data, pd.DataFrame(), station_id, zone)
+    # Keep the original timestamps so we can distinguish genuinely new rows
+    # from readings that were simply downloaded again or corrected.
+    initial_times = pd.DatetimeIndex(data["timestamp_utc"])
+    start, stop = _download_period(station, data, start_date, end_date, zone)
+    print(f"Plant {station_id}. Dates below use {zone}.", flush=True)
+    _print_period("CSV before update", len(data), _describe_period(initial_times, zone))
+    print(f"Checking API data from {start.tz_convert(zone).date()}.", flush=True)
+
+    # 3. Download about a month at a time. Save each completed piece so a later
+    # network error does not discard the progress already made.
+    for window_start, window_stop in _windows(start, stop, zone):
+        fresh = _fetch_samples(client, station_id, window_start, window_stop, zone)
+        data = _merge_samples(data, fresh, station_id, zone)
+        _save_csv(data, path)
+        print(f"Checked through {window_stop.tz_convert(zone).isoformat()}: "
+              f"{len(fresh):,} returned samples; {len(data):,} CSV rows.", flush=True)
+
+    # 4. Even an empty first download creates a CSV with headers. The metadata
+    # records what was checked, but contains no password or access token.
+    if not path.exists():
+        _save_csv(data, path)
+    summary = _save_metadata(path, station_id, zone, data, initial_times)
+    if summary["rows_added"]:
+        _print_period("New rows added", summary["rows_added"], summary["added_period"])
+    else:
+        print("New rows added: 0 (no new timestamps found).", flush=True)
+    _print_period("CSV after update", len(data), summary["csv_period_after"])
+    print(f"Saved {path}.", flush=True)
+    return data
 
 
-class _NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # Do not forward a login request or access token to another address.
-        return None
-
-
-class _DeyeClient:
-    """Handle login and the small number of API calls needed by this collector."""
-    def __init__(self, settings, interval=2):
-        self.settings = settings
-        self.interval = interval
-        self.last_request = 0.0
-        self.opener = build_opener(_NoRedirect())
-        self.token = settings.get("DEYE_ACCESS_TOKEN", "")
-        if not self.token:
-            self.login()
-
-    def login(self):
-        # Deye needs two kinds of credentials:
-        #   1. App ID + App Secret identify the developer application.
-        #   2. The account login + password determine which plants it can read.
-        # We exchange them for a temporary token; we never save that token.
-        required = [key for key in ("DEYE_APP_ID", "DEYE_APP_SECRET", "DEYE_PASSWORD")
-                    if not self.settings.get(key)]
-        if required:
-            raise ValueError("Fill these fields in .env: " + ", ".join(required))
-        app_id = self.settings["DEYE_APP_ID"]
-        if not app_id.isdigit():
-            raise ValueError("DEYE_APP_ID must contain digits only.")
-        kind = self.settings.get("DEYE_LOGIN_TYPE", "email")
-        if kind not in {"email", "mobile", "username"}:
-            raise ValueError("DEYE_LOGIN_TYPE must be email, mobile or username.")
-        login_key = "DEYE_" + kind.upper()
-        if not self.settings.get(login_key):
-            raise ValueError(f"Fill {login_key} in .env.")
-        body = {"appSecret": self.settings["DEYE_APP_SECRET"],
-                kind: self.settings[login_key],
-                # This SHA-256 format is required by Deye's token endpoint.
-                # The request itself still travels over HTTPS.
-                "password": hashlib.sha256(self.settings["DEYE_PASSWORD"].encode()).hexdigest()}
-        if kind == "mobile":
-            if not self.settings.get("DEYE_COUNTRY_CODE"):
-                raise ValueError("Fill DEYE_COUNTRY_CODE in .env for a mobile login.")
-            body["countryCode"] = self.settings["DEYE_COUNTRY_CODE"]
-        if self.settings.get("DEYE_COMPANY_ID"):
-            body["companyId"] = int(self.settings["DEYE_COMPANY_ID"])
-        result = self.post("/account/token?appId=" + app_id, body, authenticated=False)
-        self.token = result.get("accessToken", "")
-        if not self.token:
-            raise RuntimeError("Deye did not return an access token.")
-
-    def post(self, endpoint, body, *, authenticated=True, renew=True):
-        # Deye's read endpoints use HTTP POST with a JSON body. Here, POST
-        # retrieves monitoring history; it does not change inverter settings.
-        for attempt in range(5):
-            # Space requests out instead of sending a burst of API calls.
-            time.sleep(max(0, self.last_request + self.interval - time.monotonic()))
-            headers = {"Content-Type": "application/json"}
-            if authenticated:
-                headers["Authorization"] = "Bearer " + self.token
-            self.last_request = time.monotonic()
-            request = Request(API_URL + endpoint, json.dumps(body).encode(), headers)
-            try:
-                with self.opener.open(request, timeout=90) as response:
-                    result = json.load(response)
-            except HTTPError as error:
-                # A long initial download may outlive its token. Renew it once
-                # and retry this request, rather than starting the export over.
-                if error.code == 401 and authenticated and renew and self.settings.get("DEYE_PASSWORD"):
-                    self.login()
-                    return self.post(endpoint, body, renew=False)
-                if error.code in {429, 500, 502, 503, 504} and attempt < 4:
-                    # 429 means "too many requests". Respect Deye's requested
-                    # pause when given; otherwise use progressively longer waits.
-                    retry_after = error.headers.get("Retry-After", "0")
-                    try:
-                        delay = float(retry_after)
-                    except ValueError:
-                        delay = 0
-                    time.sleep(max(2 ** (attempt + 1), delay))
-                    continue
-                raise RuntimeError(f"Deye {endpoint.split('?')[0]}: HTTP {error.code}.") from None
-            except (URLError, TimeoutError, OSError):
-                if attempt == 4:
-                    raise RuntimeError("Could not connect to Deye; existing CSV was preserved.") from None
-                time.sleep(2 ** (attempt + 1))
-                continue
-            except ValueError:
-                raise RuntimeError("Deye returned an invalid JSON response.") from None
-            # HTTP 200 alone is not enough: Deye may put an API error in a
-            # successful HTTP response. Do not mistake that for an empty day.
-            if not isinstance(result, dict) or result.get("success") is not True:
-                code = result.get("code", "unknown") if isinstance(result, dict) else "unknown"
-                raise RuntimeError(f"Deye {endpoint.split('?')[0]}: API code {code}.")
-            return result
-        raise RuntimeError("Deye retry limit reached.")
-
-    def stations(self):
-        # The API returns plant lists in pages. Read all pages so a selected
-        # plant is not missed just because it was absent from the first page.
-        stations = []
-        for page in range(1, 10001):
-            result = self.post("/station/list", {"page": page, "size": 200})
-            items = result.get("stationList")
-            if not isinstance(items, list):
-                raise RuntimeError("Unexpected station-list response from Deye.")
-            if page > 1 and items == previous:
-                raise RuntimeError("Deye repeated a station-list page.")
-            stations.extend(items)
-            if len(items) < 200 or len(stations) >= int(result.get("total", 10**12)):
-                return stations
-            previous = items
-        raise RuntimeError("Too many station-list pages.")
+def _select_station(stations, requested_id):
+    """Use the only accessible plant, or select the explicitly requested one."""
+    if requested_id is None:
+        if len(stations) != 1:
+            raise ValueError("Set DEYE_STATION_ID in .env or pass station_id to select one plant.")
+        return stations[0]
+    for station in stations:
+        if str(station["id"]) == str(requested_id):
+            return station
+    raise ValueError("Plant not accessible. Check DEYE_STATION_ID and DEYE_COMPANY_ID in .env.")
 
 
 def _timestamp(value, zone):
-    """Turn Deye's Unix seconds/milliseconds or date string into an aware UTC time."""
+    """Interpret an API date string or Unix seconds/milliseconds as UTC."""
     if value is None or value == "":
         raise ValueError("Deye returned a missing timestamp.")
     try:
@@ -181,21 +102,88 @@ def _timestamp(value, zone):
     except (TypeError, ValueError):
         stamp = pd.Timestamp(value)
         if stamp.tzinfo is None:
-            # A local clock reading is not always unique when clocks change.
-            # Refuse ambiguous readings rather than silently shifting the data.
+            # Refuse to guess a local time that is ambiguous at a clock change.
             stamp = stamp.tz_localize(zone, ambiguous="raise", nonexistent="raise")
         return stamp.tz_convert("UTC")
     return pd.to_datetime(numeric, unit="ms" if abs(numeric) >= 1e12 else "s", utc=True)
 
 
 def _local_midnight(day, zone):
-    # A local day is not always 24 hours because of daylight-saving changes.
-    # Construct midnight in the plant's timezone before converting it to UTC.
-    return pd.Timestamp(datetime.combine(day, day_time.min, zone)).tz_convert("UTC")
+    # Construct local midnight first: a day can have 23 or 25 hours when clocks change.
+    return pd.Timestamp(datetime.combine(day, time.min, zone)).tz_convert("UTC")
+
+
+def _download_period(station, data, start_date, end_date, zone):
+    """Choose the first local day and the exclusive stopping time in UTC."""
+    if start_date is not None:
+        first_day = date.fromisoformat(str(start_date))
+    elif not data.empty:
+        # Refresh the last saved DAY to catch delayed or corrected readings.
+        # The timestamp merge prevents these overlapping requests making duplicates.
+        first_day = data["timestamp_utc"].max().tz_convert(zone).date()
+    else:
+        origin = station.get("startOperatingTime") or station.get("createdDate")
+        if origin is None:
+            raise ValueError("No operating date available. Pass start_date='YYYY-MM-DD'.")
+        first_day = _timestamp(origin, zone).tz_convert(zone).date()
+
+    stop = pd.Timestamp.now(tz="UTC").floor("s") + pd.Timedelta(seconds=1)
+    if end_date is not None:
+        last_day = date.fromisoformat(str(end_date))
+        if last_day < first_day:
+            raise ValueError("end_date must not be before the requested start date.")
+        stop = min(stop, _local_midnight(last_day + timedelta(days=1), zone))
+    elif station.get("lastUpdateTime") is not None:
+        # An offline plant cannot have new samples after its reported last update.
+        stop = min(stop, _timestamp(station["lastUpdateTime"], zone) + pd.Timedelta(seconds=1))
+    return _local_midnight(first_day, zone), stop
+
+
+def _windows(start, stop, zone):
+    """Split a period into consecutive 30-day requests, without gaps or overlaps."""
+    while start < stop:
+        next_day = start.tz_convert(zone).date() + timedelta(days=30)
+        following = min(stop, _local_midnight(next_day, zone))
+        yield start, following
+        start = following
+
+
+def _fetch_samples(client, station_id, start, stop, zone):
+    """Fetch one period and keep every original measurement column."""
+    result = client.post("/station/history/power", {
+        "stationId": station_id, "startTimestamp": int(start.timestamp()),
+        "endTimestamp": int(stop.timestamp()) - 1})
+    samples = result.get("stationDataItems")
+    if not isinstance(samples, list):
+        raise RuntimeError("Unexpected plant-history response; existing CSV was preserved.")
+    if result.get("total") is not None and int(result["total"]) > len(samples):
+        raise RuntimeError("Deye truncated the history response; existing CSV was preserved.")
+    if not samples:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(samples)
+    if "timeStamp" not in frame and "dateTime" not in frame:
+        raise ValueError("Deye returned a missing timestamp.")
+    source_times = frame["timeStamp"] if "timeStamp" in frame else frame["dateTime"]
+    if source_times.isna().any() or source_times.eq("").any():
+        raise ValueError("Deye returned a missing timestamp.")
+    numeric = pd.to_numeric(source_times, errors="coerce")
+    # Normal Deye responses use Unix seconds. Convert the whole column in one
+    # operation instead of calling the timestamp parser once for every reading.
+    if numeric.notna().all() and (numeric.abs() < 1e12).all():
+        timestamps = pd.to_datetime(numeric, unit="s", utc=True)
+    elif numeric.notna().all() and (numeric.abs() >= 1e12).all():
+        timestamps = pd.to_datetime(numeric, unit="ms", utc=True)
+    else:
+        timestamps = source_times.map(lambda value: _timestamp(value, zone))
+    frame["timestamp_utc"] = timestamps
+    frame["station_id"] = str(station_id)
+    # Enforce our own boundaries if the API includes an extra endpoint sample.
+    return frame.loc[(timestamps >= start) & (timestamps < stop)].copy()
 
 
 def _merge_samples(existing, fresh, station_id, zone):
-    """A newer non-null reading wins; an API null cannot erase saved data."""
+    """Match timestamps: newer non-null readings win, without erasing saved values."""
     frames = []
     for frame in (existing, fresh):
         frame = frame.copy()
@@ -204,8 +192,6 @@ def _merge_samples(existing, fresh, station_id, zone):
             continue
         if "timestamp_utc" not in frame or "station_id" not in frame:
             raise ValueError("Existing CSV needs timestamp_utc and station_id columns.")
-        # Each CSV belongs to one plant. Mixing two plants would create a
-        # misleading training dataset with overlapping timestamps.
         if set(frame["station_id"].astype(str)) != {str(station_id)}:
             raise ValueError("This CSV contains another plant; choose a separate CSV path.")
         frame["timestamp_utc"] = pd.to_datetime(frame["timestamp_utc"], utc=True, errors="raise")
@@ -213,9 +199,7 @@ def _merge_samples(existing, fresh, station_id, zone):
             raise ValueError("CSV contains a missing timestamp; existing file was preserved.")
         frame = frame.drop_duplicates("timestamp_utc", keep="last").set_index("timestamp_utc")
         frames.append(frame)
-    # Put timestamps on the index so equal timestamps match. Fresh non-null
-    # values replace old ones, and old values survive if Deye now returns null.
-    # This both appends new samples and corrects late updates without duplicates.
+    # combine_first keeps a saved value when the corresponding fresh value is null.
     merged = frames[1].combine_first(frames[0]).sort_index().reset_index()
     merged["station_id"] = str(station_id)
     merged["timestamp_local"] = merged["timestamp_utc"].map(lambda t: t.tz_convert(zone).isoformat())
@@ -224,8 +208,7 @@ def _merge_samples(existing, fresh, station_id, zone):
 
 
 def _save_csv(frame, path):
-    # Write the replacement completely before swapping it into place. If a
-    # request or write fails, the previous completed CSV remains available.
+    """Finish writing the replacement before swapping it with the existing CSV."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     output = frame.copy()
@@ -234,101 +217,36 @@ def _save_csv(frame, path):
     temporary.replace(path)
 
 
-def get_plant_data(csv_path=None, station_id=None, start_date=None, end_date=None,
-                   env_file=None, request_interval=2):
-    """Return a DataFrame and create/update its CSV with native Deye samples.
+def _describe_period(timestamps, zone):
+    """Describe the first and last actual readings, not the API request dates."""
+    if len(timestamps) == 0:
+        return None
+    first, last = timestamps.min(), timestamps.max()
+    return {"start_utc": first.isoformat(), "end_utc": last.isoformat(),
+            "start_local": first.tz_convert(zone).isoformat(),
+            "end_local": last.tz_convert(zone).isoformat()}
 
-    With no CSV, start at the plant's reported operating date (or start_date).
-    Otherwise resume from midnight of the CSV's latest local date. Optional
-    start_date overrides this for an explicit backfill; end_date is inclusive.
-    No data is interpolated, converted to other units, or replaced with zeros.
-    Each completed request is saved atomically so an interrupted run can resume.
-    """
-    path = Path(csv_path) if csv_path is not None else CSV_PATH
-    if request_interval < 0:
-        raise ValueError("request_interval cannot be negative.")
-    settings = _settings(env_file or PROJECT_ROOT / ".env")
-    requested_id = station_id or settings.get("DEYE_STATION_ID")
-    client = _DeyeClient(settings, interval=request_interval)
-    stations = client.stations()
-    # With only one accessible plant, no extra configuration is needed.
-    # Multiple plants require an explicit ID so we do not download the wrong one.
-    if requested_id is None:
-        if len(stations) != 1:
-            raise ValueError("Set DEYE_STATION_ID in .env or pass station_id to select one plant.")
-        station = stations[0]
+
+def _print_period(label, rows, period):
+    print(f"{label}: {rows:,} rows.", flush=True)
+    if period:
+        print(f"  From {period['start_local']} to {period['end_local']}.", flush=True)
     else:
-        station = next((item for item in stations if str(item["id"]) == str(requested_id)), None)
-        if station is None:
-            raise ValueError("Plant not accessible. Check DEYE_STATION_ID and DEYE_COMPANY_ID in .env.")
-    station_id = station["id"]
-    if not station.get("regionTimezone"):
-        raise ValueError("Deye did not return the plant timezone.")
-    zone = ZoneInfo(station["regionTimezone"])
-    # FIRST RUN: the file does not exist yet, so begin with an empty table.
-    # LATER RUNS: load the same CSV and use its latest timestamp as our starting
-    # point. Keep plant IDs as text so CSV reading cannot change their format.
-    existing = pd.read_csv(path, dtype={"station_id": str}) if path.exists() else pd.DataFrame()
-    # Validate an existing file before using its dates or changing it.
-    existing = _merge_samples(existing, pd.DataFrame(), station_id, zone)
-    initial_rows = len(existing)
-    if start_date is not None:
-        first_day = date.fromisoformat(str(start_date))
-    elif not existing.empty:
-        # Re-read the last saved LOCAL DAY, rather than starting one second
-        # after the last row. Deye may upload missing or corrected readings late.
-        # The merge below prevents these overlapping requests making duplicates.
-        first_day = existing["timestamp_utc"].max().tz_convert(zone).date()
-    else:
-        origin = station.get("startOperatingTime") or station.get("createdDate")
-        if origin is None:
-            raise ValueError("No operating date available. Pass start_date='YYYY-MM-DD'.")
-        first_day = _timestamp(origin, zone).tz_convert(zone).date()
-    cursor = _local_midnight(first_day, zone)
-    stop = pd.Timestamp.now(tz="UTC").floor("s") + pd.Timedelta(seconds=1)
-    if end_date is not None:
-        last_day = date.fromisoformat(str(end_date))
-        if last_day < first_day:
-            raise ValueError("end_date must not be before the requested start date.")
-        stop = min(stop, _local_midnight(last_day + timedelta(days=1), zone))
-    elif station.get("lastUpdateTime") is not None:
-        # Do not request months after an offline plant's last reported update.
-        stop = min(stop, _timestamp(station["lastUpdateTime"], zone) + pd.Timedelta(seconds=1))
-    print(f"Plant {station_id}: {initial_rows:,} existing rows. Starting {first_day}.", flush=True)
-    # Download in roughly monthly pieces. That is much faster than one request
-    # per day, while keeping responses reasonably small. Save after each piece
-    # so the next run can continue if the connection drops halfway through.
-    while cursor < stop:
-        next_day = cursor.tz_convert(zone).date() + timedelta(days=30)
-        following = min(stop, _local_midnight(next_day, zone))
-        result = client.post("/station/history/power", {
-            "stationId": station_id, "startTimestamp": int(cursor.timestamp()),
-            "endTimestamp": int(following.timestamp()) - 1})
-        samples = result.get("stationDataItems")
-        if not isinstance(samples, list):
-            raise RuntimeError("Unexpected plant-history response; existing CSV was preserved.")
-        if result.get("total") is not None and int(result["total"]) > len(samples):
-            raise RuntimeError("Deye truncated the history response; existing CSV was preserved.")
-        rows = []
-        for sample in samples:
-            stamp = _timestamp(sample.get("timeStamp", sample.get("dateTime")), zone)
-            # Enforce our own date boundaries, even if Deye includes an extra
-            # endpoint sample. Keep every original measurement column unchanged.
-            if cursor <= stamp < following:
-                rows.append({**sample, "station_id": str(station_id), "timestamp_utc": stamp})
-        existing = _merge_samples(existing, pd.DataFrame(rows), station_id, zone)
-        _save_csv(existing, path)
-        print(f"Checked through {following.tz_convert(zone).isoformat()}: "
-              f"{len(rows):,} returned samples; {len(existing):,} CSV rows.", flush=True)
-        cursor = following
-    # Also create a header-only file if the API has no historical samples.
-    if not path.exists():
-        _save_csv(existing, path)
-    # This small companion file explains where the CSV came from and when it
-    # was checked. It contains no App Secret, password or access token.
-    metadata = {"station_id": station_id, "timezone": str(zone), "rows": len(existing),
-                "rows_added": len(existing) - initial_rows,
-                "last_sample_utc": None if existing.empty else existing["timestamp_utc"].max().isoformat(),
+        print("  No readings yet.", flush=True)
+
+
+def _save_metadata(path, station_id, zone, data, initial_times):
+    """Write a small record of this update, without credentials."""
+    times = data["timestamp_utc"]
+    # Compare all timestamps, rather than only checking dates after the old
+    # maximum. This also counts new readings that fill an older gap.
+    added_times = times.loc[~times.isin(initial_times)]
+    metadata = {"station_id": station_id, "timezone": str(zone), "rows": len(data),
+                "rows_before": len(initial_times), "rows_added": len(added_times),
+                "csv_period_before": _describe_period(initial_times, zone),
+                "csv_period_after": _describe_period(times, zone),
+                "added_period": _describe_period(added_times, zone),
+                "last_sample_utc": None if data.empty else times.max().isoformat(),
                 "checked_at_utc": datetime.now(timezone.utc).isoformat(),
                 "source": API_URL + "/station/history/power",
                 "note": "Native API fields and units; no resampling or missing-value filling."}
@@ -336,13 +254,11 @@ def get_plant_data(csv_path=None, station_id=None, start_date=None, end_date=Non
     temporary = sidecar.with_suffix(sidecar.suffix + ".tmp")
     temporary.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     temporary.replace(sidecar)
-    print(f"Saved {path} (+{metadata['rows_added']:,} rows).", flush=True)
-    return existing
+    return metadata
 
 
 if __name__ == "__main__":
-    # This block runs only when the file is executed directly. Other Python
-    # files can import get_plant_data() without triggering an API download.
+    # Importing this module does not start a download. Only direct execution does.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, default=CSV_PATH)
     parser.add_argument("--station-id", type=int)
